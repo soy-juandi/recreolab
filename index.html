@@ -514,34 +514,81 @@ async function fetchRetosCSV() {
 
 function parseRetosCSV(text) {
   if (!text) return [];
+  // Parser robusto: maneja comas dentro de campos sin comillas
+  // y fechas/horas en formato serial de Excel
+  function excelSerialToDate(serial) {
+    const d = new Date(Math.round((serial - 25569) * 86400 * 1000));
+    return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate() };
+  }
+  function excelTimeToStr(frac) {
+    const totalMin = Math.round(frac * 1440);
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    const ampm = h >= 12 ? "PM" : "AM";
+    const hd = h > 12 ? h - 12 : h === 0 ? 12 : h;
+    return `${hd}:${m.toString().padStart(2,"0")} ${ampm}`;
+  }
+  // Divide línea CSV respetando comas dentro de campos largos
+  // Estrategia: los primeros 9 campos se toman por posición fija
+  // sabiendo que solo los últimos campos (lugar, metodologia, balance) pueden tener comas
+  function splitRetosLine(line) {
+    // campos fijos: reto(0), localidad(1), fecha(2), lugar(3), horaI(4), horaC(5), asistP(6), asistR(7), balance(8+)
+    // Tomamos col 0,1,2 como simples (sin comas esperadas)
+    // col 3 en adelante puede tener comas — buscamos los últimos 3 números antes del texto largo
+    const parts = line.split(",");
+    if (parts.length < 3) return null;
+    const reto = parts[0].trim();
+    const localidad = parts[1].trim();
+    const fecha = parts[2].trim();
+    // lugar puede tener comas — tomamos hasta que encontramos fracción de hora o número
+    // Heurística: col 4 y 5 son horas (fracción <1 o string "X:XX"), col 6 es número entero
+    let lugar = "", horaI = "", horaC = "", asistP = "", asistR = "", balance = "";
+    // Buscar desde atrás: últimas 2 pueden ser asistR y balance (vacíos a veces)
+    // Buscar índice donde empieza horaI: primer campo que es fracción decimal o "X:XX p.m."
+    let horaIIdx = -1;
+    for (let i = 3; i < Math.min(parts.length, 15); i++) {
+      const v = parts[i].trim();
+      const isTimeFrac = !isNaN(parseFloat(v)) && parseFloat(v) > 0 && parseFloat(v) < 1;
+      const isTimeStr = /^\d{1,2}:\d{2}/.test(v) || /p\.m\.|a\.m\./.test(v);
+      if (isTimeFrac || isTimeStr) { horaIIdx = i; break; }
+    }
+    if (horaIIdx === -1) {
+      // No encontró hora — todo después de fecha es lugar+metodologia
+      lugar = parts.slice(3).join(",").trim();
+    } else {
+      lugar = parts.slice(3, horaIIdx).join(",").trim();
+      const hI = parts[horaIIdx]?.trim() || "";
+      const hC = parts[horaIIdx+1]?.trim() || "";
+      horaI = !isNaN(parseFloat(hI)) && parseFloat(hI) < 1 ? excelTimeToStr(parseFloat(hI)) : hI;
+      horaC = !isNaN(parseFloat(hC)) && parseFloat(hC) < 1 ? excelTimeToStr(parseFloat(hC)) : hC;
+      asistP = parts[horaIIdx+2]?.trim() || "";
+      asistR = parts[horaIIdx+3]?.trim() || "";
+      balance = parts.slice(horaIIdx+4).join(",").trim();
+    }
+    return { reto, localidad, fecha, lugar, horaI, horaC, asistP, asistR, balance };
+  }
+
   const lines = text.split("\n").filter(l => l.trim());
   if (lines.length < 2) return [];
   const events = [];
   for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(",");
-    if (cols.length < 3) continue;
-    const reto      = cols[0]?.trim() || "";
-    const localidad = cols[1]?.trim() || "";
-    const fechaRaw  = cols[2]?.trim() || "";
-    const lugar     = (cols[3]?.trim() || "").replace(/;/g, ",");
-    const horaInicio= cols[4]?.trim() || "";
-    const horaCierre= cols[5]?.trim() || "";
-    const asistP    = parseInt(cols[6]) || null;
-    const asistR    = parseInt(cols[7]) || null;
-    const balance   = (cols.slice(8).join(",")?.trim() || "").replace(/;/g, ",");
-    const ejecutado = asistR !== null || balance.length > 0;
-    if (!localidad || !fechaRaw) continue;
+    const row = splitRetosLine(lines[i]);
+    if (!row) continue;
+    const { reto, localidad, fecha, lugar, horaI, horaC, asistP, asistR, balance } = row;
+    if (!localidad || !fecha) continue;
     let parsed = null;
-    const serial = parseFloat(fechaRaw);
+    const serial = parseFloat(fecha);
     if (!isNaN(serial) && serial > 40000) {
-      const d = new Date(Math.round((serial - 25569) * 86400 * 1000));
-      parsed = { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate() };
+      parsed = excelSerialToDate(serial);
     } else {
-      const dmy = fechaRaw.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+      const dmy = fecha.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
       if (dmy) parsed = { y: +dmy[3], m: +dmy[2]-1, d: +dmy[1] };
     }
     if (!parsed) continue;
-    events.push({ tipo:"RETO", reto, localidad, parsed, fechaRaw, lugar, horaInicio, horaCierre, asistP, asistR, balance, ejecutado });
+    const asistPN = parseInt(asistP) || null;
+    const asistRN = parseInt(asistR) || null;
+    const ejecutado = asistRN !== null || balance.length > 5;
+    events.push({ tipo:"RETO", reto, localidad, parsed, lugar: lugar.replace(/;/g,","), horaInicio:horaI, horaCierre:horaC, asistP:asistPN, asistR:asistRN, balance:balance.replace(/;/g,","), ejecutado });
   }
   return events;
 }
